@@ -91,8 +91,15 @@ After onboarding, `GET /` redirects to `/manage`. The panel (password-protected)
 - Configure the Log Collector URL for Unyt resource accounting
 - Join and manage Moss groups on the EdgeNode
 - Switch hardware mode between Standard EdgeNode and Wind Tunnel
+- Install, open and turn off the optional HummHive container (see [HummHive](#hummhive))
 - Change the node password
 - Trigger an immediate software update check
+
+### HummHive
+
+The panel's HummHive section installs an optional third container, `ghcr.io/hummhive/hummhive-holoport:latest`, beside EdgeNode or Wind Tunnel. It runs independently of the hardware mode (its unit has no `Conflicts=`), as `hummhive.service` from the Quadlet `/etc/containers/systemd/hummhive.container`, as uid/gid `10001`, with its data in `/var/lib/hummhive` mounted at `/data`; the unit allows 15 minutes (`TimeoutStartSec=900`) for the first start because the image is pulled inside it. Turning it off stops the service and removes the Quadlet; the data directory stays, so turning it back on finds the same node.
+
+The container uses host networking: HummHive talks to its peers over direct QUIC connections and finds devices through LAN discovery, both of which need the host's own addresses and ports rather than a NAT'd bridge. It serves its browser UI over TLS on port `9528` with a self-signed certificate. Both come from the access file the container writes: the panel shows the certificate's SHA-256 fingerprint, and fetches the access link (a bearer credential) only when the owner presses `Open HummHive`, then navigates to it. Node Manager reads that file only when it is a regular file of at most 16 KiB that is not a symlink. Set `HUMMHIVE_IMAGE` in the node-manager unit's environment to run another image reference (it must include a tag). HummHive is x86_64 only for now; on ARM nodes the panel shows the reason and the install button stays disabled.
 
 ### Self-update
 
@@ -280,6 +287,9 @@ The `UPDATE_REPO` environment variable overrides the default (`holo-host/node-ma
 | `POST` | `/manage/wind-tunnel` | session | Apply Wind Tunnel image/entrypoint config |
 | `POST` | `/manage/password` | session | Change node password |
 | `POST` | `/manage/update` | session | Trigger immediate update check |
+| `POST` | `/manage/hummhive` | session | Turn the HummHive container on or off (body `{"enabled":true\|false}`; 400 on ARM nodes) |
+| `GET` | `/manage/hummhive/status` | session | HummHive state: `enabled`, `active`, `supported`, `link_available`, `tls_fingerprint` (never the link itself) |
+| `POST` | `/manage/hummhive/open` | session | The access link `open_url` (a bearer credential), answered only when it is an `https://` link; 404 before the container has written one |
 
 Session tokens are stored in-memory and cleared on restart — operators will need to log in again after an update.
 
@@ -289,15 +299,18 @@ Session tokens are stored in-memory and cleared on restart — operators will ne
 
 | Path | Contents | Permissions |
 |------|----------|-------------|
-| `/etc/node-manager/state` | Key-value store of node state (`onboarded`, `node_name`, `hw_mode`, `unyt_agent_id`, `log_sender_endpoint`, `seed_hash`) | 600 |
+| `/etc/node-manager/state` | Key-value store of node state (`onboarded`, `node_name`, `hw_mode`, `unyt_agent_id`, `log_sender_endpoint`, `seed_hash`, `hummhive_enabled`) | 600 |
 | `/etc/node-manager/auth` | Password hash: `sha256:<salt>:<hash>` | 600 |
 | `/etc/node-manager/sessions` | Persisted session tokens | 600 |
 | `/etc/node-manager/client-meta.json` | Nomad client meta drop-in for Wind Tunnel (`unyt_agent_id`); bind-mounted read-only into the container at `/etc/nomad.d/client-meta.json` | 600 |
 | `/etc/containers/systemd/edgenode.container` | Podman Quadlet for the EdgeNode container | 644 |
 | `/etc/containers/systemd/wind-tunnel.container` | Podman Quadlet for Wind Tunnel | 644 |
+| `/etc/containers/systemd/hummhive.container` | Podman Quadlet for the optional HummHive container | 644 |
 | `/home/holo/.ssh/authorized_keys` | SSH public keys for the holo user | 600 |
 | `/var/lib/edgenode/` | EdgeNode persistent data volume | — |
 | `/var/lib/edgenode/node-manager-apps/` | Pasted hApp configs and installed-app registry | 600/700 |
+| `/var/lib/hummhive/` | HummHive persistent data volume (owned by uid/gid 10001; never removed by Node Manager) | 700 |
+| `/var/lib/hummhive/hummhive-content-holoport/keyring/holoport-access.json` | Written by the HummHive container: access link and TLS fingerprint used by the panel | — |
 
 The `seed_hash` field stores a salted SHA-256 hash of the normalized BIP39 seed phrase. The plain-text seed phrase is never written to disk.
 

@@ -3,6 +3,8 @@ use std::{
     env, fs,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    path::Path,
     process::Command,
     sync::{
         Arc, Mutex,
@@ -24,6 +26,12 @@ const SESSIONS_FILE: &str = "/etc/node-manager/sessions";
 const WIND_TUNNEL_CLIENT_META: &str = "/etc/node-manager/client-meta.json";
 const WIND_TUNNEL_LEGACY_ENV: &str = "/etc/node-manager/wind-tunnel.env";
 const QUADLET_DIR: &str = "/etc/containers/systemd";
+const HUMMHIVE_IMAGE_REF: &str = "ghcr.io/hummhive/hummhive-holoport";
+const HUMMHIVE_IMAGE_ENV: &str = "HUMMHIVE_IMAGE";
+const HUMMHIVE_UNIT: &str = "hummhive.service";
+const HUMMHIVE_DATA_DIR: &str = "/var/lib/hummhive";
+const HUMMHIVE_UID: &str = "10001";
+const HUMMHIVE_ACCESS_FILE: &str = "/var/lib/hummhive/hummhive-content-holoport/keyring/holoport-access.json";
 const AUTHORIZED_KEYS: &str = "/home/holo/.ssh/authorized_keys";
 const UPDATE_REPO_ENV: &str = "UPDATE_REPO";
 const UPDATE_REPO_DEFAULT: &str = "holo-host/node-manager";
@@ -49,6 +57,7 @@ struct AppState {
     log_sender_endpoint: Mutex<String>,
     wt_image_override:   Mutex<String>,
     wt_entrypoint_bind:  Mutex<String>,
+    hummhive_enabled:    AtomicBool,
 }
 
 impl AppState {
@@ -65,6 +74,7 @@ impl AppState {
             log_sender_endpoint: Mutex::new(kv.get("log_sender_endpoint").cloned().unwrap_or_default()),
             wt_image_override:  Mutex::new(kv.get("wt_image_override").cloned().unwrap_or_default()),
             wt_entrypoint_bind: Mutex::new(kv.get("wt_entrypoint_bind").cloned().unwrap_or_default()),
+            hummhive_enabled:   AtomicBool::new(kv.get("hummhive_enabled").map(|v| v == "true").unwrap_or(false)),
         }
     }
 }
@@ -397,6 +407,150 @@ fn build_wind_tunnel_quadlet(hostname: &str, image: &str, entrypoint_bind: Optio
         entrypoint_volume = entrypoint_volume,
         install = install,
     )
+}
+
+fn build_hummhive_quadlet(image: &str, autostart: bool) -> String {
+    let install = if autostart {
+        "\n[Install]\nWantedBy=multi-user.target\n"
+    } else {
+        ""
+    };
+    format!(
+        "[Quadlet]\nDefaultDependencies=false\n\n[Unit]\nDescription=HummHive\nWants=network-online.target\nAfter=network-online.target\nWants=podman.service\nAfter=podman.service\n\n[Container]\nImage={image}\nContainerName=hummhive\nNetwork=host\nUser={uid}\nGroup={uid}\nVolume={data_dir}:/data:Z\nLabel=io.containers.autoupdate=registry\n\n[Service]\nTimeoutStartSec=900\nRestart=always\nRestartSec=5{install}",
+        image = image,
+        uid = HUMMHIVE_UID,
+        data_dir = HUMMHIVE_DATA_DIR,
+        install = install,
+    )
+}
+
+// ── HummHive container ─────────────────────────────────────────────────────────
+
+static HUMMHIVE_SYNC: Mutex<()> = Mutex::new(());
+
+fn hummhive_quadlet_path() -> String { format!("{}/hummhive.container", QUADLET_DIR) }
+
+fn resolve_hummhive_image() -> String {
+    let image = env::var(HUMMHIVE_IMAGE_ENV).unwrap_or_default().trim().to_string();
+    if !image.is_empty() && validate_wt_image_override(&image).is_none() { return image; }
+    format!("{}:latest", HUMMHIVE_IMAGE_REF)
+}
+
+fn hummhive_supported() -> bool { detect_arch() == "x86_64" }
+
+fn hummhive_active() -> bool {
+    Command::new("systemctl").args(["is-active", HUMMHIVE_UNIT]).output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+// Toggles run on their own threads; holding the lock while reading the flag makes the
+// last toggle win on disk and in systemd, whatever order the threads start in.
+fn sync_hummhive_service(state: &AppState) {
+    let _serialised = HUMMHIVE_SYNC.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state.hummhive_enabled.load(Ordering::Relaxed) { start_hummhive_service(); } else { stop_hummhive_service(); }
+}
+
+fn log_hummhive_io(step: &str, result: std::io::Result<()>) {
+    if let Err(e) = result { eprintln!("[hummhive] {} failed: {}", step, e); }
+}
+
+fn run_hummhive_command(program: &str, args: &[&str]) -> bool {
+    match Command::new(program).args(args).output() {
+        Ok(o) if o.status.success() => true,
+        Ok(o) => {
+            eprintln!(
+                "[hummhive] {} {} failed: {}{}",
+                program,
+                args.join(" "),
+                String::from_utf8_lossy(&o.stderr),
+                String::from_utf8_lossy(&o.stdout),
+            );
+            false
+        }
+        Err(e) => { eprintln!("[hummhive] {} {} error: {}", program, args.join(" "), e); false }
+    }
+}
+
+fn start_hummhive_service() {
+    log_hummhive_io("create data dir", create_private_dir(Path::new(HUMMHIVE_DATA_DIR)));
+    run_hummhive_command("chown", &[&format!("{0}:{0}", HUMMHIVE_UID), HUMMHIVE_DATA_DIR]);
+    log_hummhive_io("create Quadlet dir", fs::create_dir_all(QUADLET_DIR));
+    let image = resolve_hummhive_image();
+    log_hummhive_io("write Quadlet", fs::write(hummhive_quadlet_path(), build_hummhive_quadlet(&image, true)));
+    run_hummhive_command("systemctl", &["daemon-reload"]);
+    run_hummhive_command("systemctl", &["reset-failed", HUMMHIVE_UNIT]);
+    if run_hummhive_command("systemctl", &["start", HUMMHIVE_UNIT]) {
+        eprintln!("[hummhive] started {} image={}", HUMMHIVE_UNIT, image);
+    }
+}
+
+// The data directory stays: it holds the node's keyring and hives, and turning the
+// container back on must find them.
+fn stop_hummhive_service() {
+    run_hummhive_command("systemctl", &["stop", HUMMHIVE_UNIT]);
+    match fs::remove_file(hummhive_quadlet_path()) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => eprintln!("[hummhive] remove Quadlet failed: {}", e),
+        _ => {}
+    }
+    run_hummhive_command("systemctl", &["daemon-reload"]);
+    eprintln!("[hummhive] stopped {}", HUMMHIVE_UNIT);
+}
+
+fn spawn_hummhive_sync(state: &Arc<AppState>) {
+    let state = Arc::clone(state);
+    thread::spawn(move || sync_hummhive_service(&state));
+}
+
+// The access file is written by the container, so a value carrying a control character is
+// treated as absent rather than passed on to the panel.
+fn access_field(json: &str, key: &str) -> String {
+    let value = json_unescape(json_str(json, key));
+    if value.chars().any(char::is_control) { String::new() } else { value }
+}
+
+fn parse_hummhive_access(json: &str) -> (String, String) {
+    (access_field(json, "lan_url"), access_field(json, "tls_fingerprint_sha256"))
+}
+
+const ACCESS_FILE_MAX_BYTES: usize = 16 * 1024;
+
+// std exposes no O_NOFOLLOW or O_NONBLOCK; these are the values in each target's fcntl.h.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const OPEN_NOFOLLOW_NONBLOCK: i32 = 0x20000 | 0o4000;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const OPEN_NOFOLLOW_NONBLOCK: i32 = 0x8000 | 0o4000;
+#[cfg(target_os = "macos")]
+const OPEN_NOFOLLOW_NONBLOCK: i32 = 0x100 | 0x4;
+
+// The container owns every component of the access file's path, so this root process must not
+// follow a symlink there, block on a FIFO, or read an unbounded file.
+fn read_small_regular_file(path: &Path) -> Option<String> {
+    let file = match fs::OpenOptions::new().read(true).custom_flags(OPEN_NOFOLLOW_NONBLOCK).open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => { eprintln!("[hummhive] access file ignored: {}", e); return None; }
+    };
+    if !file.metadata().map(|m| m.is_file()).unwrap_or(false) {
+        eprintln!("[hummhive] access file ignored: not a regular file"); return None;
+    }
+    let mut text = String::new();
+    if let Err(e) = file.take(ACCESS_FILE_MAX_BYTES as u64 + 1).read_to_string(&mut text) {
+        eprintln!("[hummhive] access file ignored: {}", e); return None;
+    }
+    if text.len() > ACCESS_FILE_MAX_BYTES {
+        eprintln!("[hummhive] access file ignored: larger than {} bytes", ACCESS_FILE_MAX_BYTES); return None;
+    }
+    Some(text)
+}
+
+fn hummhive_access(access_file: &Path) -> (String, String) {
+    parse_hummhive_access(&read_small_regular_file(access_file).unwrap_or_default())
+}
+
+fn is_open_link(url: &str) -> bool { url.starts_with("https://") }
+
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
 fn validate_unyt_agent_id(agent_id: &str) -> Option<String> {
@@ -913,6 +1067,12 @@ fn json_bool(json: &str, key: &str, default: bool) -> bool {
     if !json_has_key(json, key) { return default; }
     let v = json_str(json, key);
     !matches!(v, "false" | "0")
+}
+
+fn json_bool_literal(json: &str, key: &str) -> Option<bool> {
+    let pos = json.find(&format!("\"{}\"", key))?;
+    let after = json[pos + key.len() + 2..].trim_start().strip_prefix(':')?.trim_start();
+    if after.starts_with("true") { Some(true) } else if after.starts_with("false") { Some(false) } else { None }
 }
 
 fn json_str<'a>(json: &'a str, key: &str) -> &'a str {
@@ -1597,6 +1757,27 @@ fn build_manage_html(state: &AppState) -> String {
     </div>
   </div>
 
+  <!-- HUMMHIVE -->
+  <div class="section">
+    <div class="section-hdr" onclick="toggleSection('hummhive')">
+      <div class="section-title"><span>🐝</span> HummHive <span class="section-badge badge-gray" id="hummhive-badge">checking</span></div>
+      <span class="section-arrow" id="arr-hummhive">▼</span>
+    </div>
+    <div class="section-body" id="sec-hummhive">
+      <p id="hummhive-status" style="font-size:13px;color:#64748b;margin-bottom:14px">Checking HummHive status…</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <button class="btn btn-primary" id="hummhive-btn" onclick="toggleHummHive()" disabled>Install HummHive</button>
+        <button class="btn btn-secondary" onclick="loadHummHiveStatus()">Refresh Status</button>
+        <span class="hint" id="hummhive-unsupported" style="display:none;margin:0">HummHive is not available for ARM nodes yet</span>
+      </div>
+      <div id="hummhive-open" style="display:none;margin-top:16px">
+        <button class="btn btn-primary" id="hummhive-open-btn" onclick="openHummHive()">Open HummHive</button>
+        <p style="font-size:12px;color:#94a3b8;margin-top:8px">Certificate fingerprint (SHA-256): <code id="hummhive-fp"></code></p>
+        <p style="font-size:12px;color:#475569;margin-top:6px">Your browser will warn about the node's self-signed certificate the first time. Compare the fingerprint, then continue.</p>
+      </div>
+    </div>
+  </div>
+
   <!-- ADVANCED -->
   <div class="section">
     <div class="section-hdr" onclick="toggleSection('adv')">
@@ -1681,7 +1862,7 @@ function toggleSection(id){{
   body.style.display=open?'none':'block';
   if(arr)arr.textContent=open?'▶':'▼';
 }}
-['name','hw','unyt','happs','moss','adv','pw','upd'].forEach(id=>toggleSection(id));
+['name','hw','unyt','happs','moss','hummhive','adv','pw','upd'].forEach(id=>toggleSection(id));
 toggleSection('moss');
 document.getElementById('sec-moss').style.display='block';
 document.getElementById('arr-moss').textContent='▼';
@@ -1883,6 +2064,67 @@ function ackSeedPhrase(){{
 }}
 
 loadNodeStatus();
+
+let hummhiveEnabled=false;
+
+function hummhiveStatusText(d){{
+  if(d.active===true)return 'HummHive is running on this node.';
+  if(hummhiveEnabled)return 'HummHive is starting. The first start downloads the image and can take several minutes.';
+  return 'HummHive is not installed on this node.';
+}}
+
+function showHummHiveOpen(d){{
+  const box=document.getElementById('hummhive-open');
+  if(d.active!==true||d.link_available!==true){{box.style.display='none';return;}}
+  document.getElementById('hummhive-fp').textContent=typeof d.tls_fingerprint==='string'?d.tls_fingerprint:'';
+  box.style.display='block';
+}}
+
+async function openHummHive(){{
+  const btn=document.getElementById('hummhive-open-btn');
+  btn.disabled=true;
+  try{{
+    const d=await api('/manage/hummhive/open',{{}});
+    const url=typeof d.open_url==='string'?d.open_url:'';
+    if(!url.startsWith('https://'))throw new Error('HummHive has no access link yet');
+    location.assign(url);
+  }}catch(e){{toast('Error: '+e.message,false);btn.disabled=false;}}
+}}
+
+async function loadHummHiveStatus(){{
+  const statusEl=document.getElementById('hummhive-status');
+  try{{
+    const r=await fetch('/manage/hummhive/status',{{credentials:'same-origin'}});
+    if(r.status===401){{location.href='/login';return;}}
+    if(!r.ok)throw new Error('Server error '+r.status);
+    const d=await r.json();
+    hummhiveEnabled=d.enabled===true;
+    const badge=document.getElementById('hummhive-badge');
+    badge.textContent=d.active===true?'running':(hummhiveEnabled?'starting':'off');
+    badge.className='section-badge '+(d.active===true?'badge-green':'badge-gray');
+    statusEl.textContent=hummhiveStatusText(d);
+    const btn=document.getElementById('hummhive-btn');
+    btn.textContent=hummhiveEnabled?'Turn Off':'Install HummHive';
+    btn.className='btn '+(hummhiveEnabled?'btn-secondary':'btn-primary');
+    btn.disabled=d.supported!==true;
+    document.getElementById('hummhive-unsupported').style.display=d.supported===true?'none':'inline';
+    showHummHiveOpen(d);
+  }}catch(e){{statusEl.textContent='Could not read HummHive status: '+e.message;}}
+}}
+
+async function toggleHummHive(){{
+  const next=!hummhiveEnabled;
+  if(!next&&!confirm('Turn off HummHive? Its data stays on this node.'))return;
+  const btn=document.getElementById('hummhive-btn');
+  btn.disabled=true;btn.textContent=next?'Installing…':'Turning off…';
+  try{{
+    await api('/manage/hummhive',{{enabled:next}});
+    toast(next?'HummHive is starting':'HummHive is off',true);
+  }}catch(e){{toast('Error: '+e.message,false);}}
+  await loadHummHiveStatus();
+}}
+
+loadHummHiveStatus();
 
 function v(id){{const e=document.getElementById(id);return e?e.value.trim():'';}}
 
@@ -2183,7 +2425,7 @@ fn handle_manage_status(stream: &mut TcpStream, state: &AppState) {
     let installed_happs = read_installed_happs();
     let happs_json = installed_happs.iter().map(|name| format!("\"{}\"", json_escape(name))).collect::<Vec<_>>().join(",");
     send_json_ok(stream, &format!(
-        r#"{{"version":"{}","node_name":"{}","hw_mode":"{}","unyt_agent_id":"{}","log_sender_endpoint":"{}","edgenode_running":{},"wt_hostname":"{}","ssh_key_count":{},"ssh_keys":[{}],"uptime_secs":{},"has_seed_phrase":{},"installed_happs":[{}]}}"#,
+        r#"{{"version":"{}","node_name":"{}","hw_mode":"{}","unyt_agent_id":"{}","log_sender_endpoint":"{}","edgenode_running":{},"wt_hostname":"{}","ssh_key_count":{},"ssh_keys":[{}],"uptime_secs":{},"has_seed_phrase":{},"installed_happs":[{}],"hummhive_enabled":{}}}"#,
         VERSION,
         node_name.replace('\\', "\\\\").replace('"', "\\\""),
         hw_mode,
@@ -2192,7 +2434,8 @@ fn handle_manage_status(stream: &mut TcpStream, state: &AppState) {
         if edgenode_up { "true" } else { "false" },
         wt_hostname.replace('\\', "\\\\").replace('"', "\\\""),
         keys.len(), keys_json, uptime,
-        if has_seed { "true" } else { "false" }, happs_json
+        if has_seed { "true" } else { "false" }, happs_json,
+        state.hummhive_enabled.load(Ordering::Relaxed)
     ));
 }
 
@@ -2452,6 +2695,51 @@ fn handle_update(stream: &mut TcpStream) {
     send_json_ok(stream, r#"{"status":"update_triggered"}"#);
 }
 
+fn handle_hummhive_toggle(stream: &mut TcpStream, req: &Req, state: &Arc<AppState>) {
+    if !is_authenticated(req, state) {
+        send_json_err(stream, 401, "Not authenticated"); return;
+    }
+    let enabled = match json_bool_literal(&req.body, "enabled") {
+        Some(enabled) => enabled,
+        None => { send_json_err(stream, 400, r#"Body must be {"enabled":true} or {"enabled":false}"#); return; }
+    };
+    if !hummhive_supported() {
+        send_json_err(stream, 400, "HummHive is not available for ARM nodes yet"); return;
+    }
+    state.hummhive_enabled.store(enabled, Ordering::Relaxed);
+    update_state_key("hummhive_enabled", if enabled { "true" } else { "false" });
+    spawn_hummhive_sync(state);
+    eprintln!("[manage] HummHive {}", if enabled { "enabled" } else { "disabled" });
+    send_json_ok(stream, &format!(r#"{{"status":"ok","enabled":{}}}"#, enabled));
+}
+
+fn handle_hummhive_status(stream: &mut TcpStream, req: &Req, state: &Arc<AppState>, access_file: &Path) {
+    if !is_authenticated(req, state) {
+        send_json_err(stream, 401, "Not authenticated"); return;
+    }
+    let (open_url, tls_fingerprint) = hummhive_access(access_file);
+    send_json_ok(stream, &format!(
+        r#"{{"enabled":{},"active":{},"supported":{},"link_available":{},"tls_fingerprint":"{}"}}"#,
+        state.hummhive_enabled.load(Ordering::Relaxed),
+        hummhive_active(),
+        hummhive_supported(),
+        is_open_link(&open_url),
+        json_escape(&tls_fingerprint)
+    ));
+}
+
+// The panel is plain HTTP, so the bearer link is sent only when the owner asks to open it.
+fn handle_hummhive_open(stream: &mut TcpStream, req: &Req, state: &Arc<AppState>, access_file: &Path) {
+    if !is_authenticated(req, state) {
+        send_json_err(stream, 401, "Not authenticated"); return;
+    }
+    let (open_url, _) = hummhive_access(access_file);
+    if !is_open_link(&open_url) {
+        send_json_err(stream, 404, "HummHive has no access link yet"); return;
+    }
+    send_json_ok(stream, &format!(r#"{{"open_url":"{}"}}"#, json_escape(&open_url)));
+}
+
 // ── Main ───────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -2476,6 +2764,10 @@ fn main() {
                 }
             }
         });
+    }
+
+    if state.onboarded.load(Ordering::Relaxed) && state.hummhive_enabled.load(Ordering::Relaxed) {
+        spawn_hummhive_sync(&state);
     }
 
     // Spawn background update checker
@@ -2699,6 +2991,17 @@ fn main() {
                     }
                 },
 
+                // The HummHive handlers run the session guard themselves, so their 401 is unit-tested.
+                ("POST", "/manage/hummhive") => handle_hummhive_toggle(&mut stream, &req, &state),
+
+                ("GET", "/manage/hummhive/status") => {
+                    handle_hummhive_status(&mut stream, &req, &state, Path::new(HUMMHIVE_ACCESS_FILE))
+                },
+
+                ("POST", "/manage/hummhive/open") => {
+                    handle_hummhive_open(&mut stream, &req, &state, Path::new(HUMMHIVE_ACCESS_FILE))
+                },
+
                 _ => {
                     send_response(&mut stream, 404, "Not Found", "text/plain", b"404 Not Found");
                 },
@@ -2709,11 +3012,22 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, Req, handle_submit, validate_unyt_agent_id, validate_wt_hostname};
+    use super::{
+        AppState, Req, build_hummhive_quadlet, create_private_dir, create_session, handle_hummhive_open,
+        handle_hummhive_status, handle_hummhive_toggle, handle_submit, hummhive_supported, json_bool_literal,
+        parse_hummhive_access, read_small_regular_file, read_state_file, validate_unyt_agent_id,
+        validate_wt_hostname, ACCESS_FILE_MAX_BYTES,
+    };
     use std::{
+        fs,
         io::Read,
         net::{TcpListener, TcpStream},
-        sync::{Arc, Mutex},
+        os::unix::fs::PermissionsExt,
+        path::{Path, PathBuf},
+        process::Command,
+        sync::{Arc, Mutex, mpsc},
+        thread,
+        time::Duration,
     };
 
     const USER_AGENT_ID: &str = "uhCAkEgwsRQmYpVUGWSdNyziQgQZu1sfXVlVIR0sbEZJBd5N6wYr_";
@@ -2752,6 +3066,64 @@ mod tests {
             .parse::<u16>()
             .unwrap_or(0)
     }
+
+    const HUMMHIVE_TEST_IMAGE: &str = "ghcr.io/hummhive/hummhive-holoport:latest";
+    const HUMMHIVE_QUADLET_CONTRACT: &str = "[Quadlet]
+DefaultDependencies=false
+
+[Unit]
+Description=HummHive
+Wants=network-online.target
+After=network-online.target
+Wants=podman.service
+After=podman.service
+
+[Container]
+Image=ghcr.io/hummhive/hummhive-holoport:latest
+ContainerName=hummhive
+Network=host
+User=10001
+Group=10001
+Volume=/var/lib/hummhive:/data:Z
+Label=io.containers.autoupdate=registry
+
+[Service]
+TimeoutStartSec=900
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+";
+
+    fn hummhive_request(method: &str, path: &str, cookie: Option<&str>, body: &str) -> Req {
+        let headers = cookie.map(|t| format!("Cookie: session={}\r\n", t)).unwrap_or_default();
+        Req { method: method.into(), path: path.into(), headers, body: body.into() }
+    }
+
+    fn drive_hummhive(handler: impl FnOnce(&mut TcpStream)) -> (u16, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        handler(&mut stream);
+        drop(stream);
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        let response = String::from_utf8_lossy(&response).into_owned();
+        let status = response.split_whitespace().nth(1).unwrap_or("0").parse::<u16>().unwrap_or(0);
+        let body = response.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+        (status, body)
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("node-manager-test-{}-{}", name, std::process::id()));
+        if dir.exists() { fs::remove_dir_all(&dir).unwrap(); }
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    const ACCESS_SAMPLE: &str = r#"{"lan_url":"https://192.168.1.20:9528/#t=tok_123","loopback_url":"http://127.0.0.1:9527/#t=tok_123","tls_fingerprint_sha256":"AA:BB:CC"}"#;
+
+    fn mode_of(path: &Path) -> u32 { fs::metadata(path).unwrap().permissions().mode() & 0o777 }
 
     #[test]
     fn empty_agent_id_is_valid() {
@@ -2808,5 +3180,156 @@ mod tests {
     #[test]
     fn new_nodes_can_still_submit() {
         assert_eq!(submit_status_for_state(false), 200);
+    }
+
+    #[test]
+    fn hummhive_quadlet_with_autostart_matches_contract_bytes() {
+        assert_eq!(build_hummhive_quadlet(HUMMHIVE_TEST_IMAGE, true), HUMMHIVE_QUADLET_CONTRACT);
+    }
+
+    #[test]
+    fn hummhive_quadlet_autostart_controls_install_block() {
+        let on = build_hummhive_quadlet("registry.example/humm:edge", true);
+        let off = build_hummhive_quadlet("registry.example/humm:edge", false);
+        for text in [&on, &off] {
+            assert!(text.contains("Image=registry.example/humm:edge\n"));
+            assert!(text.contains("Network=host\n"));
+            assert!(text.contains("User=10001\n"));
+            assert!(text.contains("Volume=/var/lib/hummhive:/data:Z\n"));
+            assert!(!text.contains("Conflicts="));
+            assert!(text.contains("[Service]\nTimeoutStartSec=900\nRestart=always\n"));
+        }
+        assert!(on.ends_with("RestartSec=5\n[Install]\nWantedBy=multi-user.target\n"));
+        assert!(!off.contains("[Install]"));
+        assert!(!off.contains("WantedBy="));
+        assert!(off.ends_with("RestartSec=5"));
+    }
+
+    #[test]
+    fn hummhive_access_parses_url_and_fingerprint_per_field() {
+        let sample = r#"{"lan_url":"https://192.168.1.20:9528/#t=abcDEF_-123","loopback_url":"http://localhost:9527/#t=abcDEF_-123","tls_fingerprint_sha256":"AA:BB:CC"}"#;
+        assert_eq!(
+            parse_hummhive_access(sample),
+            ("https://192.168.1.20:9528/#t=abcDEF_-123".to_string(), "AA:BB:CC".to_string())
+        );
+        assert_eq!(
+            parse_hummhive_access(r#"{"lan_url":"https://10.0.0.5:9528/#t=x"}"#),
+            ("https://10.0.0.5:9528/#t=x".to_string(), String::new())
+        );
+        assert_eq!(parse_hummhive_access("{}"), (String::new(), String::new()));
+        assert_eq!(
+            parse_hummhive_access(r#"{"lan_url":"https://10.0.0.5:9528/\n","tls_fingerprint_sha256":"AA:BB"}"#),
+            (String::new(), "AA:BB".to_string())
+        );
+    }
+
+    #[test]
+    fn hummhive_enabled_body_needs_a_boolean_literal() {
+        assert_eq!(json_bool_literal(r#"{"enabled":false}"#, "enabled"), Some(false));
+        assert_eq!(json_bool_literal(r#"{ "enabled" : true }"#, "enabled"), Some(true));
+        assert_eq!(json_bool_literal(r#"{"enabled":"false"}"#, "enabled"), None);
+        assert_eq!(json_bool_literal("{}", "enabled"), None);
+    }
+
+    #[test]
+    fn unauthenticated_hummhive_toggle_answers_401_and_keeps_state() {
+        let state = Arc::new(AppState::new(false));
+        let stored_before = read_state_file().get("hummhive_enabled").cloned();
+        let req = hummhive_request("POST", "/manage/hummhive", None, r#"{"enabled":true}"#);
+        let (status, body) = drive_hummhive(|s| handle_hummhive_toggle(s, &req, &state));
+        assert_eq!((status, body.as_str()), (401, r#"{"error":"Not authenticated"}"#));
+        assert!(!state.hummhive_enabled.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(read_state_file().get("hummhive_enabled").cloned(), stored_before);
+
+        let token = create_session(&state);
+        let req = hummhive_request("POST", "/manage/hummhive", Some(&token), r#"{"enabled":"yes"}"#);
+        let (status, body) = drive_hummhive(|s| handle_hummhive_toggle(s, &req, &state));
+        assert_eq!((status, body.as_str()), (400, r#"{"error":"Body must be {\"enabled\":true} or {\"enabled\":false}"}"#));
+    }
+
+    #[test]
+    fn hummhive_status_says_whether_a_link_exists_without_handing_it_out() {
+        let dir = scratch_dir("status");
+        let access_file = dir.join("holoport-access.json");
+        let state = Arc::new(AppState::new(false));
+        let req = hummhive_request("GET", "/manage/hummhive/status", None, "");
+        let (status, body) = drive_hummhive(|s| handle_hummhive_status(s, &req, &state, &access_file));
+        assert_eq!((status, body.as_str()), (401, r#"{"error":"Not authenticated"}"#));
+
+        let token = create_session(&state);
+        let req = hummhive_request("GET", "/manage/hummhive/status", Some(&token), "");
+        let expected = |available: bool, fingerprint: &str| format!(
+            r#"{{"enabled":false,"active":false,"supported":{},"link_available":{},"tls_fingerprint":"{}"}}"#,
+            hummhive_supported(), available, fingerprint
+        );
+        let (status, body) = drive_hummhive(|s| handle_hummhive_status(s, &req, &state, &access_file));
+        assert_eq!((status, body), (200, expected(false, "")));
+
+        fs::write(&access_file, ACCESS_SAMPLE).unwrap();
+        let (status, body) = drive_hummhive(|s| handle_hummhive_status(s, &req, &state, &access_file));
+        assert_eq!((status, body), (200, expected(true, "AA:BB:CC")));
+    }
+
+    #[test]
+    fn hummhive_open_hands_out_only_an_https_link_to_a_session() {
+        let dir = scratch_dir("open");
+        let access_file = dir.join("holoport-access.json");
+        fs::write(&access_file, ACCESS_SAMPLE).unwrap();
+        let state = Arc::new(AppState::new(false));
+        let req = hummhive_request("POST", "/manage/hummhive/open", None, "{}");
+        let (status, body) = drive_hummhive(|s| handle_hummhive_open(s, &req, &state, &access_file));
+        assert_eq!((status, body.as_str()), (401, r#"{"error":"Not authenticated"}"#));
+
+        let token = create_session(&state);
+        let req = hummhive_request("POST", "/manage/hummhive/open", Some(&token), "{}");
+        let (status, body) = drive_hummhive(|s| handle_hummhive_open(s, &req, &state, &access_file));
+        assert_eq!((status, body.as_str()), (200, r#"{"open_url":"https://192.168.1.20:9528/#t=tok_123"}"#));
+
+        fs::write(&access_file, r#"{"lan_url":"http://192.168.1.20:9528/#t=tok_123"}"#).unwrap();
+        let (status, body) = drive_hummhive(|s| handle_hummhive_open(s, &req, &state, &access_file));
+        assert_eq!((status, body.as_str()), (404, r#"{"error":"HummHive has no access link yet"}"#));
+    }
+
+    #[test]
+    fn access_file_reads_only_a_small_regular_file() {
+        let dir = scratch_dir("access-read");
+        let regular = dir.join("regular.json");
+        fs::write(&regular, ACCESS_SAMPLE).unwrap();
+        assert_eq!(read_small_regular_file(&regular).as_deref(), Some(ACCESS_SAMPLE));
+
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&regular, &link).unwrap();
+        assert_eq!(read_small_regular_file(&link), None);
+
+        let at_cap = dir.join("at-cap.json");
+        fs::write(&at_cap, vec![b' '; ACCESS_FILE_MAX_BYTES]).unwrap();
+        assert_eq!(read_small_regular_file(&at_cap).map(|s| s.len()), Some(ACCESS_FILE_MAX_BYTES));
+        let over_cap = dir.join("over-cap.json");
+        fs::write(&over_cap, vec![b' '; ACCESS_FILE_MAX_BYTES + 1]).unwrap();
+        assert_eq!(read_small_regular_file(&over_cap), None);
+    }
+
+    #[test]
+    fn access_file_that_is_a_fifo_is_refused_without_blocking() {
+        let fifo = scratch_dir("access-fifo").join("fifo.json");
+        assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || sender.send(read_small_regular_file(&fifo)).unwrap());
+        // A blocking open never answers; the bound turns that hang into a failure.
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(5)), Ok(None));
+    }
+
+    #[test]
+    fn hummhive_data_dir_is_private_whether_new_or_existing() {
+        let dir = scratch_dir("private-dir");
+        let existing = dir.join("existing");
+        fs::create_dir(&existing).unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o755)).unwrap();
+        create_private_dir(&existing).unwrap();
+        assert_eq!(mode_of(&existing), 0o700);
+
+        let fresh = dir.join("fresh").join("nested");
+        create_private_dir(&fresh).unwrap();
+        assert_eq!(mode_of(&fresh), 0o700);
     }
 }
