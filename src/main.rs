@@ -3121,7 +3121,7 @@ WantedBy=multi-user.target
         dir
     }
 
-    const ACCESS_SAMPLE: &str = r#"{"lan_url":"https://192.168.1.20:9528/#t=tok_123","loopback_url":"http://127.0.0.1:9527/#t=tok_123","tls_fingerprint_sha256":"AA:BB:CC"}"#;
+    const ACCESS_SAMPLE: &str = r#"{"lan_url":"https://192.168.1.20:9528/#t=tok_123","loopback_url":"http://127.0.0.1:9529/#t=tok_123","tls_fingerprint_sha256":"AA:BB:CC"}"#;
 
     fn mode_of(path: &Path) -> u32 { fs::metadata(path).unwrap().permissions().mode() & 0o777 }
 
@@ -3207,7 +3207,7 @@ WantedBy=multi-user.target
 
     #[test]
     fn hummhive_access_parses_url_and_fingerprint_per_field() {
-        let sample = r#"{"lan_url":"https://192.168.1.20:9528/#t=abcDEF_-123","loopback_url":"http://localhost:9527/#t=abcDEF_-123","tls_fingerprint_sha256":"AA:BB:CC"}"#;
+        let sample = r#"{"lan_url":"https://192.168.1.20:9528/#t=abcDEF_-123","loopback_url":"http://127.0.0.1:9529/#t=abcDEF_-123","tls_fingerprint_sha256":"AA:BB:CC"}"#;
         assert_eq!(
             parse_hummhive_access(sample),
             ("https://192.168.1.20:9528/#t=abcDEF_-123".to_string(), "AA:BB:CC".to_string())
